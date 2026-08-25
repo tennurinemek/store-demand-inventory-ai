@@ -1,165 +1,332 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
+"""
+AI destekli talep tahmini ve dinamik stok yönetimi paneli.
 
-# --- Sayfa Yapılandırması ---
+Gösterilen bütün tahminler LightGBM modelinin 2017 test seti çıktısıdır
+(src/build_artifacts.py tarafından üretilir). Panelde hiçbir sayı gerçek
+satıştan türetilmez veya elle ölçeklenmez.
+"""
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+DATA = Path(__file__).parent / "data"
+
+Z_SCORES = {"%90 (Z = 1.28)": 1.28, "%95 (Z = 1.65)": 1.65, "%99 (Z = 2.33)": 2.33}
+MODEL_HORIZON = 7  # Modelin en kısa gecikmesi 7 gün: geçerli tahmin ufku 7 gün.
+
 st.set_page_config(
-    page_title="AI Destekli Talep ve Stok Optimizasyonu",
-    page_icon="t",
-    layout="wide"
+    page_title="Talep Tahmini ve Stok Optimizasyonu",
+    page_icon="📦",
+    layout="wide",
 )
 
-# --- Başlık ve Açıklama ---
-st.title(" AI Destekli Talep Tahmini & Dinamik Stok Yönetimi")
-st.markdown("""
-Bu interaktif panel; **LightGBM regresyon modeli**, geçmiş talep örüntüleri ve **istatistiksel güvenlik stoğu** formülleriyle 
-mağaza ve ürün bazında optimum tedarik seviyelerini ve envanter erime simülasyonunu yönetir.
-""")
 
-# --- Veri Yükleme ---
+# --------------------------------------------------------------------------- #
+# Veri
+# --------------------------------------------------------------------------- #
 @st.cache_data
 def load_assets():
-    safety_df = pd.read_csv('safety_stocks.csv')
-    hist_df = pd.read_csv('historical_sales.csv')
-    hist_df['date'] = pd.to_datetime(hist_df['date'])
-    return safety_df, hist_df
+    forecasts = pd.read_parquet(DATA / "forecasts_2017.parquet")
+    forecasts["date"] = pd.to_datetime(forecasts["date"])
+    metrics = pd.read_csv(DATA / "item_metrics.csv")
+    return forecasts, metrics
+
 
 try:
-    safety_df, hist_df = load_assets()
-except Exception as e:
-    st.error(f"Veri dosyaları yüklenirken hata oluştu: {e}")
+    forecasts, metrics = load_assets()
+except FileNotFoundError:
+    st.error(
+        "Tahmin dosyaları bulunamadı. Önce `python src/build_artifacts.py` komutunu "
+        "çalıştırarak `data/forecasts_2017.parquet` ve `data/item_metrics.csv` "
+        "dosyalarını üretin."
+    )
     st.stop()
 
-# --- Yan Panel (Kontrol Paneli) ---
-st.sidebar.header(" Seçim Paneli")
 
-store_id = st.sidebar.selectbox("Mağaza Seçiniz:", sorted(hist_df['store'].unique()))
-item_id = st.sidebar.selectbox("Ürün Seçiniz:", sorted(hist_df['item'].unique()))
+# --------------------------------------------------------------------------- #
+# Envanter simülasyonu
+# --------------------------------------------------------------------------- #
+def simulate_inventory(demand, forecast, lead_time, safety_stock, order_qty):
+    """
+    (s, Q) sürekli gözden geçirme politikası.
+
+    Her gün:
+      1. O gün teslim edilmesi planlanan siparişler depoya girer.
+      2. Talep karşılanır; stok yetmezse aradaki fark kayıp satıştır.
+      3. Stok pozisyonu (eldeki + yoldaki) sipariş noktasının altındaysa Q adetlik
+         sipariş verilir ve `lead_time` gün sonra teslim alınır.
+
+    Yoldaki siparişlerin stok pozisyonuna dahil edilmesi, teslimat beklenirken aynı
+    ihtiyaç için tekrar tekrar sipariş açılmasını (over-ordering) önler.
+
+    Sipariş noktası her gün yeniden hesaplanır:
+        ROP_t = (t+1 ... t+L günleri için model tahminlerinin toplamı) + SS
+    """
+    n = len(demand)
+    pipeline = np.zeros(n + lead_time + 1)  # pipeline[i]: i. günün başında gelen miktar
+
+    # Başlangıç stoğu: siparişi yeni teslim alınmış bir döngünün tepesi.
+    # Düşük bir başlangıç değeri, ilk sipariş L gün sonra geleceği için ölçümü
+    # yapay olarak bozar; bu yüzden ilk L gün ayrıca ısınma sayılır.
+    initial_lt_demand = forecast[:lead_time].sum() if n >= lead_time else forecast.sum()
+    on_hand = float(np.ceil(initial_lt_demand + safety_stock) + order_qty)
+
+    rows = []
+    for t in range(n):
+        arrived = pipeline[t]
+        on_hand += arrived
+
+        sold = min(on_hand, demand[t])
+        lost = demand[t] - sold
+        on_hand -= sold
+
+        # Tedarik süresi boyunca beklenen talep, modelin kendi tahminlerinden.
+        window = forecast[t + 1 : t + 1 + lead_time]
+        expected = window.sum() if len(window) else forecast[t] * lead_time
+        rop = int(np.ceil(expected + safety_stock))
+
+        position = on_hand + pipeline[t + 1 :].sum()
+
+        ordered = 0
+        while position <= rop and ordered < order_qty * 10:  # güvenlik sınırı
+            pipeline[t + lead_time] += order_qty
+            position += order_qty
+            ordered += order_qty
+
+        rows.append(
+            {
+                "Gelen sipariş": arrived,
+                "Talep": demand[t],
+                "Karşılanan": sold,
+                "Kayıp satış": lost,
+                "Gün sonu stok": on_hand,
+                "Yoldaki stok": pipeline[t + 1 :].sum(),
+                "Sipariş noktası (ROP)": rop,
+                "Verilen sipariş": ordered,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------- #
+# Kontrol paneli
+# --------------------------------------------------------------------------- #
+st.sidebar.header("Seçim")
+store_id = st.sidebar.selectbox("Mağaza", sorted(forecasts["store"].unique()))
+item_id = st.sidebar.selectbox("Ürün", sorted(forecasts["item"].unique()))
 
 st.sidebar.markdown("---")
-st.sidebar.subheader(" Tedarik Zinciri Parametreleri")
-lead_time = st.sidebar.slider("Tedarik Süresi (Lead Time - Gün):", min_value=1, max_value=14, value=3)
-service_level = st.sidebar.selectbox(
-    "Hizmet Seviyesi (Service Level):", 
-    options=["%90 (Z=1.28)", "%95 (Z=1.65)", "%99 (Z=2.33)"], 
-    index=1
+st.sidebar.header("Tedarik zinciri parametreleri")
+lead_time = st.sidebar.slider("Tedarik süresi (gün)", 1, 14, 3)
+service_level = st.sidebar.selectbox("Hizmet seviyesi", list(Z_SCORES), index=1)
+order_qty = st.sidebar.number_input(
+    "Sipariş parti büyüklüğü (MOQ)", min_value=20, max_value=400, value=60, step=10
+)
+sim_days = st.sidebar.slider("Simülasyon uzunluğu (gün)", 30, 365, 90, step=30)
+
+z_score = Z_SCORES[service_level]
+target_service = float(service_level[1:3])
+
+if lead_time > MODEL_HORIZON:
+    st.sidebar.warning(
+        f"Model {MODEL_HORIZON} gün ileriye tahmin üretiyor. Daha uzun tedarik "
+        "süreleri için tahminlerin tekrarlı (recursive) olarak uzatılması gerekir; "
+        "bu ayarda sonuçlar iyimser."
+    )
+
+# --------------------------------------------------------------------------- #
+# Seçilen mağaza-ürün
+# --------------------------------------------------------------------------- #
+subset = (
+    forecasts[(forecasts["store"] == store_id) & (forecasts["item"] == item_id)]
+    .sort_values("date")
+    .reset_index(drop=True)
+)
+row = metrics[(metrics["store"] == store_id) & (metrics["item"] == item_id)].iloc[0]
+
+sigma_error = row["error_std"]
+item_wape = row["wape"]
+item_mae = row["mae"]
+mean_forecast = row["mean_forecast"]
+
+# SS = Z × σ_hata × √L
+safety_stock = int(np.ceil(z_score * sigma_error * np.sqrt(lead_time)))
+static_rop = int(np.ceil(mean_forecast * lead_time + safety_stock))
+
+st.title("Talep tahmini ve dinamik stok yönetimi")
+st.caption(
+    "LightGBM talep tahminini güvenlik stoğu ve yeniden sipariş noktası politikasıyla "
+    "birleştiren karar destek paneli. Tüm tahminler modelin 2017 test seti çıktısıdır."
 )
 
-order_batch_size = st.sidebar.number_input("Parti Sipariş Miktarı (Parti Büyüklüğü / MOQ):", min_value=20, max_value=200, value=60, step=10)
-
-z_map = {"%90 (Z=1.28)": 1.28, "%95 (Z=1.65)": 1.65, "%99 (Z=2.33)": 2.33}
-z_score = z_map[service_level]
-
-# --- Güvenlik Stoğu Hesabı ---
-store_item_safety = safety_df[(safety_df['store'] == store_id) & (safety_df['item'] == item_id)]
-
-if not store_item_safety.empty:
-    sigma_error = store_item_safety['error_std'].values[0]
-else:
-    sigma_error = 7.0
-
-dynamic_safety_stock = int(np.ceil(z_score * sigma_error * np.sqrt(lead_time)))
-
-# --- 2017 Verisi, ROP ve Dinamik WAPE Hesabı ---
-subset_hist = hist_df[(hist_df['store'] == store_id) & (hist_df['item'] == item_id)].copy()
-subset_2017 = subset_hist[subset_hist['date'] >= '2017-01-01'].copy()
-
-avg_daily_demand = subset_2017['sales'].mean()
-reorder_point = int(np.ceil((avg_daily_demand * lead_time) + dynamic_safety_stock))
-
-# Seçilen ürün için dinamik WAPE hesabı
-total_sales = subset_2017['sales'].sum()
-# Model hata sapması üzerinden dinamik WAPE yaklaşımı
-if total_sales > 0:
-    item_wape = (sigma_error / avg_daily_demand) * 100 * 0.8  # Gerçekçi dinamik ölçekleme
-    item_wape = min(max(item_wape, 6.5), 22.0)  # Makul aralık sınırlandırması
-else:
-    item_wape = 10.41
-
-# --- KPI Kartları ---
-st.markdown("###  Operasyonel Özet Göstergeleri")
-col1, col2, col3, col4 = st.columns(4)
-
-col1.metric(label="Günlük Ortalama Talep", value=f"{avg_daily_demand:.1f} Adet")
-col2.metric(label="Dinamik Güvenlik Stoğu (SS)", value=f"{dynamic_safety_stock} Adet")
-col3.metric(label="Yeniden Sipariş Noktası (ROP)", value=f"{reorder_point} Adet")
-col4.metric(label="Ürüne Özel WAPE", value=f"%{item_wape:.2f}", delta="Dinamik Hata Oranı")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Ortalama günlük tahmin", f"{mean_forecast:.1f} adet")
+c2.metric("Güvenlik stoğu (SS)", f"{safety_stock} adet")
+c3.metric(
+    "Sipariş noktası (ROP)",
+    f"{static_rop} adet",
+    help="Ortalama tahmin üzerinden hesaplanan referans değer. "
+    "Simülasyonda her gün yeniden hesaplanır.",
+)
+c4.metric(
+    "Bu ürünün WAPE'i",
+    f"%{item_wape:.2f}",
+    help=f"MAE: {item_mae:.2f} adet — modelin bu mağaza-ürün için 2017'deki gerçek hatası.",
+)
 
 st.markdown("---")
 
-# --- Zaman Serisi Grafiği ---
-st.markdown(f"###  Mağaza {store_id} - Ürün {item_id} Talep Trendi (2017)")
+# --------------------------------------------------------------------------- #
+# Tahmin - gerçekleşen karşılaştırması
+# --------------------------------------------------------------------------- #
+st.subheader(f"Mağaza {store_id} · Ürün {item_id} — tahmin ve gerçekleşen (2017)")
 
 fig = go.Figure()
-
-fig.add_trace(go.Scatter(
-    x=subset_2017['date'],
-    y=subset_2017['sales'],
-    mode='lines',
-    name='Gerçek Satış',
-    line=dict(color='#2b5c8f', width=1.5)
-))
-
-fig.add_trace(go.Scatter(
-    x=subset_2017['date'],
-    y=[dynamic_safety_stock] * len(subset_2017),
-    mode='lines',
-    name='Güvenlik Stoğu Eşiği',
-    line=dict(color='#d9534f', dash='dash', width=2)
-))
-
+fig.add_trace(
+    go.Scatter(
+        x=subset["date"],
+        y=subset["sales"],
+        name="Gerçekleşen satış",
+        mode="lines",
+        line=dict(color="#2b5c8f", width=1.4),
+    )
+)
+fig.add_trace(
+    go.Scatter(
+        x=subset["date"],
+        y=subset["prediction"],
+        name="Model tahmini",
+        mode="lines",
+        line=dict(color="#e08214", width=1.4),
+    )
+)
+fig.add_hline(
+    y=safety_stock,
+    line=dict(color="#d9534f", dash="dash", width=2),
+    annotation_text="Güvenlik stoğu",
+    annotation_position="top left",
+)
 fig.update_layout(
     xaxis_title="Tarih",
-    yaxis_title="Satış Adedi",
+    yaxis_title="Adet",
     template="plotly_white",
     hovermode="x unified",
-    height=400
+    height=380,
+    legend=dict(orientation="h", y=1.12),
 )
-
 st.plotly_chart(fig, use_container_width=True)
 
-# --- Gerçekçi Envanter Erime & Sipariş Tetikleme Simülasyonu ---
-st.markdown("### Dinamik Envanter Takibi ve Sipariş Tetikleme Simülasyonu (Son 14 Gün)")
-st.caption("Fiziki stok her gün gerçekleşen satışla erir. ")
-
-sim_data = subset_2017.tail(14).copy().reset_index(drop=True)
-
-# Simülasyon döngüsü
-current_stock = reorder_point + int(avg_daily_demand * 2)
-stock_levels = []
-order_triggers = []
-forecasted_demands = []
-
-for idx, row in sim_data.iterrows():
-    pred = round(row['sales'] * 0.98, 1)
-    forecasted_demands.append(pred)
-
-    current_stock -= row['sales']
-
-    if current_stock <= reorder_point:
-        order_triggers.append(" Sipariş Ver (Eşik Altı)")
-        current_stock += order_batch_size
-    else:
-        order_triggers.append(" Stok Yeterli")
-
-    stock_levels.append(max(0, current_stock))
-
-sim_data['Tahmini_Talep'] = forecasted_demands
-sim_data['Gun_Sonu_Fiziki_Stok'] = stock_levels
-sim_data['Guvenlik_Stogu'] = dynamic_safety_stock
-sim_data['Siparis_Esigi_ROP'] = reorder_point
-sim_data['Karar_Durumu'] = order_triggers
-
-display_cols = ['date', 'sales', 'Tahmini_Talep', 'Gun_Sonu_Fiziki_Stok', 'Guvenlik_Stogu', 'Siparis_Esigi_ROP', 'Karar_Durumu']
-st.dataframe(
-    sim_data[display_cols].rename(columns={
-        'date': 'Tarih',
-        'sales': 'Gerçek Satış',
-        'Gun_Sonu_Fiziki_Stok': 'Gün Sonu Kalan Stok',
-        'Guvenlik_Stogu': 'Güvenlik Stoğu (SS)',
-        'Siparis_Esigi_ROP': 'Sipariş Eşiği (ROP)',
-        'Karar_Durumu': 'Sistem Kararı'
-    }),
-    use_container_width=True
+# --------------------------------------------------------------------------- #
+# Simülasyon
+# --------------------------------------------------------------------------- #
+st.subheader(f"Envanter simülasyonu — son {sim_days} gün")
+st.caption(
+    "Stok her gün gerçekleşen talep kadar erir. Sipariş noktasına inildiğinde sipariş "
+    f"açılır ve {lead_time} gün sonra teslim alınır."
 )
+
+sim_input = subset.tail(sim_days).reset_index(drop=True)
+sim = simulate_inventory(
+    demand=sim_input["sales"].to_numpy(dtype=float),
+    forecast=sim_input["prediction"].to_numpy(dtype=float),
+    lead_time=lead_time,
+    safety_stock=safety_stock,
+    order_qty=int(order_qty),
+)
+sim.insert(0, "Tarih", sim_input["date"].dt.date)
+
+# İlk L gün ısınma dönemi: başlangıç stoğunun etkisi ölçümden çıkarılır.
+measured = sim.iloc[lead_time:]
+total_demand = measured["Talep"].sum()
+fill_rate = (
+    (1 - measured["Kayıp satış"].sum() / total_demand) * 100 if total_demand else 100.0
+)
+stockout_days = int((measured["Kayıp satış"] > 0).sum())
+n_orders = int((measured["Verilen sipariş"] > 0).sum())
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric(
+    "Gerçekleşen hizmet seviyesi",
+    f"%{fill_rate:.2f}",
+    delta=f"{fill_rate - target_service:+.2f} puan (hedefe göre)",
+)
+m2.metric("Stoksuz gün", f"{stockout_days} gün")
+m3.metric("Verilen sipariş", f"{n_orders} kez")
+m4.metric("Ortalama elde stok", f"{measured['Gün sonu stok'].mean():.0f} adet")
+
+fig2 = go.Figure()
+fig2.add_trace(
+    go.Scatter(
+        x=sim["Tarih"],
+        y=sim["Gün sonu stok"],
+        name="Eldeki stok",
+        mode="lines",
+        fill="tozeroy",
+        line=dict(color="#2b5c8f", width=1.6),
+    )
+)
+fig2.add_trace(
+    go.Scatter(
+        x=sim["Tarih"],
+        y=sim["Sipariş noktası (ROP)"],
+        name="Sipariş noktası",
+        mode="lines",
+        line=dict(color="#e08214", dash="dot", width=1.6),
+    )
+)
+fig2.add_hline(
+    y=safety_stock,
+    line=dict(color="#d9534f", dash="dash", width=1.6),
+    annotation_text="Güvenlik stoğu",
+)
+order_days = sim[sim["Verilen sipariş"] > 0]
+fig2.add_trace(
+    go.Scatter(
+        x=order_days["Tarih"],
+        y=order_days["Gün sonu stok"],
+        name="Sipariş verildi",
+        mode="markers",
+        marker=dict(color="#1a7f37", size=8, symbol="triangle-up"),
+    )
+)
+fig2.update_layout(
+    xaxis_title="Tarih",
+    yaxis_title="Adet",
+    template="plotly_white",
+    hovermode="x unified",
+    height=380,
+    legend=dict(orientation="h", y=1.12),
+)
+st.plotly_chart(fig2, use_container_width=True)
+
+with st.expander("Günlük simülasyon tablosu"):
+    st.dataframe(sim.round(1), use_container_width=True, hide_index=True)
+
+with st.expander("Yöntem ve sınırlılıklar"):
+    st.markdown(
+        f"""
+**Formüller**
+
+- Güvenlik stoğu: `SS = Z × σ_hata × √L`. Buradaki `σ_hata`, modelin bu mağaza-ürün
+  için 2017'deki günlük tahmin hatalarının standart sapmasıdır ({sigma_error:.2f} adet).
+- Sipariş noktası her gün yeniden hesaplanır:
+  `ROP_t = (t+1 … t+L günlerinin model tahminleri toplamı) + SS`
+
+**Sınırlılıklar**
+
+- Veri seti Kaggle *Store Item Demand Forecasting Challenge* verisidir ve sentetiktir.
+  Fiyat, promosyon, kampanya ve geçmiş stoksuzluk bilgisi içermez; gerçek perakende
+  talebi bu veriden daha düzensizdir.
+- Modelin en kısa gecikmesi 7 gün olduğundan geçerli tahmin ufku 7 gündür. Daha uzun
+  tedarik sürelerinde tahminlerin tekrarlı olarak uzatılması gerekir.
+- `√L` çarpanı günlük tahmin hatalarının bağımsız olduğunu varsayar. Hatalar
+  otokorelasyonluysa gerçek güvenlik stoğu ihtiyacı bundan yüksektir.
+- Simülasyon karşılanamayan talebi kayıp satış (lost sales) sayar; ertelenmiş talep
+  (backorder) senaryosu modellenmemiştir.
+"""
+    )
